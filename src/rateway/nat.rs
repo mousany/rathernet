@@ -1,5 +1,6 @@
 use super::{
     adapter::{flatten, write_packet, AtewayAdapterTask},
+    builtin::NAT_PORT_RANGE,
     AtewayIoError, AtewayIoSocket,
 };
 use crate::{
@@ -13,17 +14,22 @@ use crate::{
 use anyhow::Result;
 use futures::future::BoxFuture;
 use ipnet::Ipv4Net;
+use lru::LruCache;
 use packet::{
     ether, icmp,
     ip::{self, Protocol},
-    Packet, PacketMut,
+    tcp, udp, Packet, PacketMut,
 };
+use parking_lot::Mutex;
 use pcap::{Active, Capture, Device};
 use std::{
     collections::HashMap,
     future::Future,
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroUsize,
+    ops::Range,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::{
@@ -109,6 +115,11 @@ pub(super) fn find_device(ip: Ipv4Addr) -> Result<Device> {
 }
 
 async fn nat_daemon(config: AtewayNatConfig, device: AsioDevice) -> Result<()> {
+    let table = Arc::new(Mutex::new(AtewayNatTable::new(
+        NAT_PORT_RANGE,
+        config.route_config.clone(),
+    )));
+
     let (tx_socket, rx_socket) =
         AcsmaIoSocket::try_from_device(config.socket_config.clone(), &device)?;
 
@@ -116,7 +127,7 @@ async fn nat_daemon(config: AtewayNatConfig, device: AsioDevice) -> Result<()> {
 
     let device = find_device(config.host)?;
     let mut cap = Capture::from_device(device)?.immediate_mode(true).open()?;
-    cap.filter("ip", true)?;
+    cap.filter(&format!("ip dst host {}", config.host), true)?;
 
     let (write_tx, write_rx) = mpsc::unbounded_channel();
 
@@ -126,8 +137,9 @@ async fn nat_daemon(config: AtewayNatConfig, device: AsioDevice) -> Result<()> {
         write_tx.clone(),
         rx_socket,
         raw_socket,
+        table.clone(),
     ));
-    let send_handle = tokio::spawn(send_daemon(config, write_tx, cap));
+    let send_handle = tokio::spawn(send_daemon(config, write_tx, cap, table));
 
     tokio::try_join!(
         flatten(write_handle),
@@ -173,6 +185,7 @@ async fn receive_daemon(
     write_tx: UnboundedSender<AtewayAdapterTask>,
     mut rx_socket: AcsmaSocketReader,
     mut raw_socket: AtewayIoSocket,
+    table: Arc<Mutex<AtewayNatTable>>,
 ) -> Result<()> {
     let net = Ipv4Net::with_netmask(config.address, config.netmask)?;
 
@@ -200,7 +213,59 @@ async fn receive_daemon(
                     }
                 }
             } else if !net.contains(&dest) {
-                log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
+                let mut packet = packet.to_owned();
+                packet.set_source(config.host)?;
+
+                if protocol == Protocol::Icmp {
+                    log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
+                    let mut icmp = icmp::Packet::new(packet.payload_mut())?;
+                    if let Ok(mut echo) = icmp.echo_mut() {
+                        let mut guard = table.lock();
+                        let port = guard.forward((src, echo.identifier()));
+                        log::debug!(
+                            "Forward {}:{} to {}:{}",
+                            src,
+                            echo.identifier(),
+                            config.host,
+                            port
+                        );
+                        echo.set_identifier(port)?.checked();
+                    } else {
+                        continue;
+                    }
+                } else if protocol == Protocol::Udp {
+                    log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
+                    let enclosing = packet.to_owned();
+                    let mut udp = udp::Packet::new(packet.payload_mut())?;
+                    let mut guard = table.lock();
+                    let port = guard.forward((src, udp.source()));
+                    log::debug!(
+                        "Forward {}:{} to {}:{}",
+                        src,
+                        udp.source(),
+                        config.host,
+                        port
+                    );
+                    udp.set_source(port)?.checked(&ip::Packet::V4(enclosing));
+                } else if protocol == Protocol::Tcp {
+                    log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
+                    let enclosing = packet.to_owned();
+                    let mut tcp = tcp::Packet::new(packet.payload_mut())?;
+                    let mut guard = table.lock();
+                    let port = guard.forward((src, tcp.source()));
+                    log::debug!(
+                        "Forward {}:{} to {}:{}",
+                        src,
+                        tcp.source(),
+                        config.host,
+                        port
+                    );
+                    tcp.set_source(port)?.checked(&ip::Packet::V4(enclosing));
+                } else {
+                    continue;
+                }
+
+                packet.update_checksum()?;
                 raw_socket.send(packet.as_ref())?;
             }
         }
@@ -212,18 +277,83 @@ async fn send_daemon(
     config: AtewayNatConfig,
     write_tx: UnboundedSender<AtewayAdapterTask>,
     mut cap: Capture<Active>,
+    table: Arc<Mutex<AtewayNatTable>>,
 ) -> Result<()> {
-    let net = Ipv4Net::with_netmask(config.address, config.netmask)?;
     while let Ok(capture) = task::block_in_place(|| cap.next_packet()) {
         let eth = ether::Packet::new(capture.data)?;
         if eth.protocol() == ether::Protocol::Ipv4 {
-            let packet = ip::v4::Packet::new(eth.payload().to_owned())?;
+            let mut packet = ip::v4::Packet::new(eth.payload().to_owned())?;
             let src = packet.source();
             let dest = packet.destination();
             let protocol = packet.protocol();
 
-            if dest.is_broadcast() || net.contains(&dest) {
-                log::debug!("Send packet {} -> {} ({:?})", src, dest, protocol);
+            if dest == config.host {
+                if protocol == Protocol::Icmp {
+                    let mut icmp = icmp::Packet::new(packet.payload_mut())?;
+                    if let Ok(mut echo) = icmp.echo_mut() {
+                        let mut guard = table.lock();
+                        if let Some((addr, port)) = guard.backward(echo.identifier()) {
+                            log::debug!("Send packet {} -> {} ({:?})", src, dest, protocol);
+                            log::debug!(
+                                "Backward {}:{} to {}:{}",
+                                config.address,
+                                echo.identifier(),
+                                src,
+                                port
+                            );
+                            echo.set_identifier(port)?.checked();
+                            packet.set_destination(addr)?;
+                        } else {
+                            continue;
+                        }
+                    }
+                } else if protocol == Protocol::Udp {
+                    let mut enclosing = packet.to_owned();
+                    let mut udp = udp::Packet::new(packet.payload_mut())?;
+                    let mut guard = table.lock();
+                    if let Some((addr, port)) = guard.backward(udp.destination()) {
+                        log::debug!("Send packet {} -> {} ({:?})", src, dest, protocol);
+                        log::debug!(
+                            "Backward {}:{} to {}:{}",
+                            config.host,
+                            udp.destination(),
+                            addr,
+                            port
+                        );
+
+                        enclosing.set_destination(addr)?;
+                        udp.set_destination(port)?
+                            .checked(&ip::Packet::V4(enclosing));
+                        packet.set_destination(addr)?;
+                    } else {
+                        continue;
+                    }
+                } else if protocol == Protocol::Tcp {
+                    let mut enclosing = packet.to_owned();
+                    let mut tcp = tcp::Packet::new(packet.payload_mut())?;
+                    let mut guard = table.lock();
+                    if let Some((addr, port)) = guard.backward(tcp.destination()) {
+                        log::debug!("Send packet {} -> {} ({:?})", src, dest, protocol);
+                        log::debug!(
+                            "Backward {}:{} to {}:{}",
+                            config.host,
+                            tcp.destination(),
+                            addr,
+                            port
+                        );
+
+                        enclosing.set_destination(addr)?;
+                        tcp.set_destination(port)?
+                            .checked(&ip::Packet::V4(enclosing));
+                        packet.set_destination(addr)?;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                packet.update_checksum()?;
                 if let Err(err) = write_packet(&write_tx, packet.to_owned()).await {
                     log::warn!("Packet dropped {}", err);
                 }
@@ -232,4 +362,97 @@ async fn send_daemon(
     }
 
     Ok(())
+}
+
+type AtewayNatEntry = (Ipv4Addr, u16);
+
+struct AtewayNatDynTable(LruCache<u16, Option<AtewayNatEntry>>);
+
+impl AtewayNatDynTable {
+    fn new(range: Range<u16>, exclude: &HashMap<u16, AtewayNatEntry>) -> Self {
+        let len = range.len();
+        let mut table = if len > 0 {
+            LruCache::new(NonZeroUsize::new(len).unwrap())
+        } else {
+            LruCache::unbounded()
+        };
+        for port in range {
+            if exclude.contains_key(&port) {
+                continue;
+            }
+            table.put(port, None);
+        }
+        Self(table)
+    }
+
+    fn forward(&mut self, entry: AtewayNatEntry) -> u16 {
+        let pair = self.0.iter().find(|(_, &v)| v == Some(entry));
+        match pair {
+            Some((&port, _)) => {
+                self.0.promote(&port);
+                port
+            }
+            None => {
+                let (port, _) = self.0.pop_lru().unwrap();
+                self.0.put(port, Some(entry));
+                port
+            }
+        }
+    }
+
+    fn backward(&mut self, port: u16) -> Option<AtewayNatEntry> {
+        match self.0.get(&port) {
+            Some(Some(entry)) => Some(*entry),
+            _ => None,
+        }
+    }
+}
+
+struct AtewayStaticTable(HashMap<u16, AtewayNatEntry>);
+
+impl AtewayStaticTable {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn forward(&self, entry: AtewayNatEntry) -> Option<u16> {
+        self.0.iter().find(|(_, &v)| v == entry).map(|(&k, _)| k)
+    }
+
+    fn backward(&self, port: u16) -> Option<AtewayNatEntry> {
+        self.0.get(&port).copied()
+    }
+}
+
+struct AtewayNatTable {
+    dyn_table: AtewayNatDynTable,
+    static_table: AtewayStaticTable,
+}
+
+impl AtewayNatTable {
+    fn new(range: Range<u16>, routes: Option<HashMap<u16, SocketAddrV4>>) -> Self {
+        let mut static_table = AtewayStaticTable::new();
+        if let Some(map) = routes {
+            for (port, addr) in map {
+                static_table.0.insert(port, (*addr.ip(), addr.port()));
+            }
+        }
+
+        Self {
+            dyn_table: AtewayNatDynTable::new(range, &static_table.0),
+            static_table,
+        }
+    }
+
+    fn forward(&mut self, entry: AtewayNatEntry) -> u16 {
+        self.static_table
+            .forward(entry)
+            .unwrap_or_else(|| self.dyn_table.forward(entry))
+    }
+
+    fn backward(&mut self, port: u16) -> Option<AtewayNatEntry> {
+        self.static_table
+            .backward(port)
+            .or_else(|| self.dyn_table.backward(port))
+    }
 }
