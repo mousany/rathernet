@@ -1,5 +1,4 @@
 mod adapter;
-mod fragment;
 mod nat;
 mod socket;
 

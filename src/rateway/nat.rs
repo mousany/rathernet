@@ -1,7 +1,6 @@
 use super::{
     adapter::{flatten, write_packet, AtewayAdapterTask},
     builtin::NAT_PORT_RANGE,
-    fragment::{self, Assembler},
     AtewayIoError, AtewayIoSocket,
 };
 use crate::{
@@ -9,7 +8,6 @@ use crate::{
         builtin::SOCKET_BROADCAST_ADDRESS, AcsmaIoSocket, AcsmaSocketConfig, AcsmaSocketReader,
         AcsmaSocketWriter,
     },
-    rateway::fragment::is_first_fragment,
     rather::encode::{DecodeToBytes, EncodeFromBytes},
     raudio::AsioDevice,
 };
@@ -157,7 +155,7 @@ async fn write_daemon(
     mut write_rx: UnboundedReceiver<AtewayAdapterTask>,
 ) -> Result<()> {
     let net = Ipv4Net::with_netmask(config.address, config.netmask)?;
-    'a: while let Some((packet, tx)) = write_rx.recv().await {
+    while let Some((packet, tx)) = write_rx.recv().await {
         let ip = packet.destination();
         let dest = if ip == net.broadcast() || ip.is_broadcast() {
             Ok(SOCKET_BROADCAST_ADDRESS)
@@ -170,28 +168,14 @@ async fn write_daemon(
             Ok(config.socket_config.mac)
         };
 
-        match dest {
+        let result = match dest {
             Ok(inner) => {
                 log::debug!("Resolve MAC address: {} -> {}", ip, inner);
-                let packets = match fragment::split_packet(packet) {
-                    Ok(packets) => packets,
-                    Err(err) => {
-                        tx.send(Err(err)).ok();
-                        continue;
-                    }
-                };
-                for packet in packets {
-                    if let Err(err) = tx_socket.write(inner, &packet.encode()).await {
-                        tx.send(Err(err)).ok();
-                        continue 'a;
-                    }
-                }
-                tx.send(Ok(())).ok();
+                tx_socket.write(inner, &packet.as_ref().encode()).await
             }
-            Err(err) => {
-                tx.send(Err(err)).ok();
-            }
+            Err(err) => Err(err),
         };
+        let _ = tx.send(result);
     }
     Ok(())
 }
@@ -204,7 +188,6 @@ async fn receive_daemon(
     table: Arc<Mutex<AtewayNatTable>>,
 ) -> Result<()> {
     let net = Ipv4Net::with_netmask(config.address, config.netmask)?;
-    let mut assembler = Assembler::new();
 
     while let Ok(packet) = rx_socket.read_unchecked().await {
         let bytes = DecodeToBytes::decode(&packet);
@@ -229,46 +212,28 @@ async fn receive_daemon(
                         }
                     }
                 }
-            } else if !net.contains(&dest) && dest != config.host {
-                if protocol == Protocol::Icmp {
-                    packet.set_source(config.host)?;
-
-                    log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
-
-                    if is_first_fragment(&packet) {
-                        let mut icmp = icmp::Packet::new(packet.payload_mut())?;
-                        if let Ok(mut echo) = icmp.echo_mut() {
-                            let mut guard = table.lock();
-                            let port = guard.forward((src, echo.identifier()));
-                            log::debug!(
-                                "Forward {}:{} to {}:{}",
-                                src,
-                                echo.identifier(),
-                                config.host,
-                                port
-                            );
-                            echo.set_identifier(port)?.checked();
-                        }
-                    } else {
-                        log::debug!("Forward {} -> {} as is", src, dest);
-                    }
-
-                    packet.update_checksum()?;
-                    raw_socket.send(packet.as_ref())?;
-                    continue;
-                }
-
-                let mut packet = match assembler.assemble(packet) {
-                    Ok(Some(packet)) => packet,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        log::warn!("Packet dropped {}", err);
-                        continue;
-                    }
-                };
+            } else if !net.contains(&dest) {
+                let mut packet = packet.to_owned();
                 packet.set_source(config.host)?;
 
-                if protocol == Protocol::Udp {
+                if protocol == Protocol::Icmp {
+                    log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
+                    let mut icmp = icmp::Packet::new(packet.payload_mut())?;
+                    if let Ok(mut echo) = icmp.echo_mut() {
+                        let mut guard = table.lock();
+                        let port = guard.forward((src, echo.identifier()));
+                        log::debug!(
+                            "Forward {}:{} to {}:{}",
+                            src,
+                            echo.identifier(),
+                            config.host,
+                            port
+                        );
+                        echo.set_identifier(port)?.checked();
+                    } else {
+                        continue;
+                    }
+                } else if protocol == Protocol::Udp {
                     log::debug!("Receive packet {} -> {} ({:?})", src, dest, protocol);
                     let enclosing = packet.to_owned();
                     let mut udp = udp::Packet::new(packet.payload_mut())?;

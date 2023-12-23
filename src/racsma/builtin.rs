@@ -35,7 +35,7 @@ pub const SOCKET_RECIEVE_TIMEOUT: Duration = Duration::from_millis(25);
 
 pub const SOCKET_MAX_RESENDS: usize = 8;
 pub const SOCKET_MAX_RANGE: usize = 6;
-pub const SOCKET_JAR_CAPACITY: usize = 4;
+pub const SOCKET_JAR_CAPACITY: usize = 8;
 
 pub const SOCKET_FREE_THRESHOLD: f32 = 1e-5;
 pub const SOCKET_COLISION_THRESHOLD: f32 = 1e-4;
@@ -46,4 +46,3 @@ pub const SOCKET_PING_INTERVAL: Duration = Duration::from_millis(4000);
 pub const SOCKET_PING_TIMEOUT: Duration = Duration::from_millis(2000);
 
 pub const SOCKET_BROADCAST_ADDRESS: usize = (1 << ADDRESS_BITS_LEN) - 1;
-pub const SOCKET_BYTES_MTU: usize = PAYLOAD_BITS_LEN / 8;
