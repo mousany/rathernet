@@ -87,6 +87,7 @@ impl AcsmaSocketReader {
         let mut bucket = BTreeMap::new();
         while let Some(frame) = self.read_rx.recv().await {
             let header = frame.header().clone();
+            log::info!("Receive frame {}", header.seq);
             if let NonAckFrame::Data(data) = frame {
                 let payload = data.payload().unwrap();
                 bucket.entry(header.seq).or_insert(payload.to_owned());
@@ -100,6 +101,9 @@ impl AcsmaSocketReader {
             acc.extend_from_bitslice(payload);
             acc
         });
+
+        log::info!("Read {} frames, total {}", bucket.len(), result.len());
+
         Ok(result)
     }
 
@@ -310,16 +314,6 @@ async fn socket_daemon(
     let mut write_monitor = AcsmaSocketWriteMonitor::new(write_monitor);
     let mut read_jar = AllocRingBuffer::new(SOCKET_JAR_CAPACITY);
     loop {
-        // log::debug!("----------State machine loop----------");
-        // match &write_state {
-        //     Some(timer) => {
-        //         log::debug!("Timer is has elapsed {}", timer.elapsed().as_millis());
-        //         log::debug!("Expect to elapse {}", timer.duration().as_millis());
-        //     }
-        //     None => {
-        //         log::debug!("Timer is None")
-        //     }
-        // }
         if let Ok(Some(bits)) = time::timeout(SOCKET_RECIEVE_TIMEOUT, read_ather.next()).await {
             // log::debug!("Got frame len: {}", bits.len());
             if let Ok(frame) = AcsmaFrame::try_from(bits) {
@@ -349,11 +343,7 @@ async fn socket_daemon(
                             }
                         }
                     }
-                } else {
-                    // log::debug!("Recieve frame but not for me");
                 }
-            } else {
-                // log::debug!("Recieve frame but checksum failed");
             }
         }
 
@@ -386,7 +376,7 @@ async fn socket_daemon(
                                 // log::debug!("Medium state: free. Colision detected {}", header.seq);
                                 Some(create_backoff(&mut rng, inner, retry + 1))
                             } else {
-                                // log::debug!("Medium state: free. Resent {}", header.seq);              
+                                // log::debug!("Medium state: free. Resent {}", header.seq);
                                 Some(AcsmaSocketWriteTimer::timeout(
                                     inner.task,
                                     inner.resends + 1,
@@ -394,10 +384,7 @@ async fn socket_daemon(
                             }
                         }
                     }
-                    _ => {
-                        // log::debug!("Backoff timer expired. No task");
-                        None
-                    }
+                    _ => None,
                 }
             } else {
                 write_state = Some(timer);
@@ -409,13 +396,21 @@ async fn socket_daemon(
                 // log::debug!("Accepted frame from source with index {}", header.seq);
                 write_state = if !is_channel_free(&config, &mut write_monitor).await {
                     // log::debug!("Medium state: busy. set backoff timer");
-                    Some(create_backoff(&mut rng, AcsmaSocketWriteTimerInner { task, resends: 0 }, 0))
+                    Some(create_backoff(
+                        &mut rng,
+                        AcsmaSocketWriteTimerInner { task, resends: 0 },
+                        0,
+                    ))
                 } else {
                     // log::debug!("Medium state: free. Sending {}", header.seq);
                     let bits = Into::<BitVec>::into(task.0.clone());
                     if !write_bits(&config, &write_ather, &mut write_monitor, &bits).await? {
                         // log::debug!("Medium state: free. Colision detected");
-                        Some(create_backoff(&mut rng, AcsmaSocketWriteTimerInner { task, resends: 0 }, 1))
+                        Some(create_backoff(
+                            &mut rng,
+                            AcsmaSocketWriteTimerInner { task, resends: 0 },
+                            1,
+                        ))
                     } else {
                         // log::debug!("Medium state: free. Sent {}", header.seq);
                         Some(AcsmaSocketWriteTimer::timeout(task, 0))
@@ -582,7 +577,11 @@ impl AcsmaSocketWriteTimer {
         }
     }
 
-    fn backoff(inner: Option<AcsmaSocketWriteTimerInner>, retry: usize, duration: Duration) -> Self {        
+    fn backoff(
+        inner: Option<AcsmaSocketWriteTimerInner>,
+        retry: usize,
+        duration: Duration,
+    ) -> Self {
         Self::Backoff {
             start: Instant::now(),
             inner,
